@@ -33,22 +33,54 @@ def clean(seq: str) -> str:
     return s
 
 # ---------------- Your model logic (placeholder now) ----------------
-def predict_with_model(seq: str) -> Dict[str, Any]:
-    """
-    Replace this later with your real ESM-2 inference.
-    """
-    function = "Enzyme catalysis" if ("H" in seq or "D" in seq) else "Structural protein"
-    confidence = 0.87
-    application = "Biotechnology" if function.startswith("Enzyme") else "Agriculture"
+# load reference ESM embeddings
+EMB_MATRIX = np.load("embeddings.npy")
+with open("labels.json") as f:
+    REF_LABELS = json.load(f)
+
+from sklearn.neighbors import NearestNeighbors
+nbrs = NearestNeighbors(n_neighbors=1, metric="cosine").fit(EMB_MATRIX)
+
+# load ESM model
+model, alphabet = esm.pretrained.esm2_t6_8M_UR50D()
+batch_converter = alphabet.get_batch_converter()
+device = "cpu"
+model = model.to(device)
+model.eval()
+
+def embed_sequence(seq: str):
+    data = [("seq", seq)]
+    _, _, tokens = batch_converter(data)
+    tokens = tokens.to(device)
+
+    with torch.no_grad():
+        out = model(tokens, repr_layers=[6])
+        rep = out["representations"][6][:, 1:-1, :]
+        rep = rep.mean(dim=1)
+
+    return rep.cpu().numpy()[0]
+    
+def predict_with_model(sequence: str):
+    # embed input
+    emb = embed_sequence(sequence).reshape(1, -1)
+
+    # nearest neighbor search
+    dist, idx = nbrs.kneighbors(emb)
+    idx = idx[0][0]
+    confidence = 1 - float(dist[0][0])
+
+    # output predicted class
+    function = REF_LABELS[idx]
+
     return {
         "function": function,
         "confidence": confidence,
-        "application": application,
+        "application": "Biotechnology" if "zyme" in function.lower() else "Medicine",
         "important_regions": [
-            {"start": 10, "end": 25, "importance": 0.9},
-            {"start": 50, "end": 70, "importance": 0.8}
+            {"start": 5, "end": 10, "importance": 0.7},
+            {"start": 20, "end": 30, "importance": 0.6},
         ],
-        "key_amino_acids": [15, 23, 58, 62]
+        "key_amino_acids": [7, 22]
     }
 # -------------------------------------------------------------------
 
