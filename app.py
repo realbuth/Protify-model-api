@@ -1,7 +1,11 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from typing import Optional, List, Dict, Any
-import re
+import esm
+import torch
+import numpy as np
+import json
+from sklearn.neighbors import NearestNeighbors
+from fastapi import FastAPI
+
+EMB_MATRIX = np.load("embeddings.npy")
 
 app = FastAPI(title="Protify Model API")
 
