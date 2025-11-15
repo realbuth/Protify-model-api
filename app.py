@@ -1,115 +1,163 @@
-import esm
+from typing import List, Dict, Any
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+
 import torch
 import numpy as np
 import json
-from sklearn.neighbors import NearestNeighbors
-from fastapi import FastAPI
+import esm
 
-EMB_MATRIX = np.load("embeddings.npy")
 
-app = FastAPI(title="Protify Model API")
-
-# Validate amino acid sequence
-AA = re.compile(r"^[ACDEFGHIKLMNPQRSTVWY]+$", re.I)
-
-class PredictIn(BaseModel):
-    sequence: str
+# ---------- Pydantic models ----------
 
 class Region(BaseModel):
     start: int
     end: int
     importance: float
 
+
+class PredictIn(BaseModel):
+    sequence: str
+
+
 class PredictOut(BaseModel):
     function: str
     confidence: float
     application: str
-    important_regions: Optional[List[Region]] = None
-    key_amino_acids: Optional[List[int]] = None
+    important_regions: List[Region]
+    key_amino_acids: List[int]
 
-def clean(seq: str) -> str:
-    s = (seq or "").strip()
-    if s.startswith(">"):
-        s = "\n".join(ln for ln in s.splitlines() if not ln.startswith(">"))
-    s = s.replace(" ", "").replace("\n", "").upper()
-    if not s or not AA.match(s):
-        raise HTTPException(status_code=400, detail="Invalid sequence (use standard amino acids).")
-    return s
 
-# ---------------- Your model logic (placeholder now) ----------------
-# load reference ESM embeddings
-EMB_MATRIX = np.load("embeddings.npy")
-with open("labels.json") as f:
-    REF_LABELS = json.load(f)
+# ---------- FastAPI app ----------
 
-from sklearn.neighbors import NearestNeighbors
-nbrs = NearestNeighbors(n_neighbors=1, metric="cosine").fit(EMB_MATRIX)
+app = FastAPI(
+    title="Protify Model API",
+    version="0.1.0",
+)
 
-# load ESM model
-model, alphabet = esm.pretrained.esm2_t6_8M_UR50D()
-batch_converter = alphabet.get_batch_converter()
-device = "cpu"
-model = model.to(device)
-model.eval()
 
-def embed_sequence(seq: str):
+# ---------- Load reference embeddings + labels ----------
+
+try:
+    EMB_MATRIX = np.load("embeddings.npy")        # shape (N, D)
+    with open("labels.json") as f:
+        REF_LABELS = json.load(f)                 # length N
+except Exception as e:
+    print("ERROR loading embeddings/labels:", e)
+    EMB_MATRIX = None
+    REF_LABELS = None
+
+
+# ---------- Load ESM model (tiny, for deployment) ----------
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+ESM_MODEL, ESM_ALPHABET = esm.pretrained.esm2_t6_8M_UR50D()
+ESM_MODEL = ESM_MODEL.to(DEVICE)
+ESM_MODEL.eval()
+
+BATCH_CONVERTER = ESM_ALPHABET.get_batch_converter()
+
+
+# ---------- Helper: embed a sequence with ESM ----------
+
+def _embed_sequence(seq: str) -> np.ndarray:
+    # clean sequence
+    seq = seq.upper()
+    seq = "".join(c for c in seq if c in "ACDEFGHIKLMNPQRSTVWY")
+    if not seq:
+        return np.zeros(EMB_MATRIX.shape[1], dtype=np.float32)
+
     data = [("seq", seq)]
-    _, _, tokens = batch_converter(data)
-    tokens = tokens.to(device)
+    _, _, tokens = BATCH_CONVERTER(data)
+    tokens = tokens.to(DEVICE)
 
     with torch.no_grad():
-        out = model(tokens, repr_layers=[6])
-        rep = out["representations"][6][:, 1:-1, :]
-        rep = rep.mean(dim=1)
+        out = ESM_MODEL(tokens, repr_layers=[6])
+        rep = out["representations"][6][:, 1:-1, :]   # drop CLS/EOS
+        rep = rep.mean(dim=1)                         # [1, D]
 
     return rep.cpu().numpy()[0]
-    
-def predict_with_model(sequence: str):
-    # embed input
-    emb = embed_sequence(sequence).reshape(1, -1)
 
-    # nearest neighbor search
-    dist, idx = nbrs.kneighbors(emb)
-    idx = idx[0][0]
-    confidence = 1 - float(dist[0][0])
 
-    # output predicted class
-    function = REF_LABELS[idx]
+# ---------- Core prediction logic (real model) ----------
+
+def predict_with_model(seq: str) -> Dict[str, Any]:
+    if EMB_MATRIX is None or REF_LABELS is None:
+        raise RuntimeError("Embeddings/labels not loaded on server.")
+
+    q = _embed_sequence(seq)                          # [D]
+    # normalize for cosine similarity
+    q_norm = q / (np.linalg.norm(q) + 1e-8)
+
+    emb_norm = EMB_MATRIX / (
+        np.linalg.norm(EMB_MATRIX, axis=1, keepdims=True) + 1e-8
+    )  # [N, D]
+
+    sims = emb_norm @ q_norm                          # [N]
+    best_idx = int(np.argmax(sims))
+    best_sim = float(sims[best_idx])
+
+    function = str(REF_LABELS[best_idx])
+    # map cosine sim (-1..1) → [0,1]
+    confidence = max(0.0, min(1.0, (best_sim + 1.0) / 2.0))
+
+    # very simple heuristic regions based on sequence length
+    L = max(1, len(seq))
+    window = max(10, min(25, L // 4))
+
+    regions: List[Dict[str, Any]] = []
+    if L >= window:
+        # first high-importance region
+        regions.append({
+            "start": 1,
+            "end": min(window, L),
+            "importance": 0.9,
+        })
+    if L >= 2 * window:
+        # second medium-importance region
+        regions.append({
+            "start": max(1, L - window),
+            "end": L,
+            "importance": 0.75,
+        })
+
+    # key amino acids: just pick a few positions spread in the sequence
+    key_positions: List[int] = []
+    for frac in [0.15, 0.35, 0.55, 0.75, 0.9]:
+        pos = int(frac * L)
+        if 1 <= pos <= L:
+            key_positions.append(pos)
+    key_positions = sorted(set(key_positions))
+
+    # map function → application
+    low = function.lower()
+    if "enzyme" in low or "catalysis" in low:
+        application = "Biotechnology"
+    elif "dna" in low or "binding" in low:
+        application = "Medicine"
+    else:
+        application = "Agriculture"
 
     return {
         "function": function,
         "confidence": confidence,
-        "application": "Biotechnology" if "zyme" in function.lower() else "Medicine",
-        "important_regions": [
-            {"start": 5, "end": 10, "importance": 0.7},
-            {"start": 20, "end": 30, "importance": 0.6},
-        ],
-        "key_amino_acids": [7, 22]
+        "application": application,
+        "important_regions": regions,
+        "key_amino_acids": key_positions,
     }
-# -------------------------------------------------------------------
+
+
+# ---------- FastAPI endpoint ----------
 
 @app.post("/predict", response_model=PredictOut)
-def predict(inp: PredictIn):
-    seq = clean(inp.sequence)
+def predict(inp: PredictIn) -> PredictOut:
+    seq = inp.sequence.strip().upper()
+    if not seq:
+        raise HTTPException(status_code=422, detail="Sequence is empty.")
     if len(seq) > 5000:
         raise HTTPException(status_code=422, detail="Sequence too long (max 5000 aa).")
+
     result = predict_with_model(seq)
-
-    fn = str(result.get("function"))
-    cf = float(result.get("confidence"))
-    app_field = str(result.get("application"))
-    if app_field not in {"Medicine", "Agriculture", "Biotechnology"}:
-        app_field = "Biotechnology"
-    cf = max(0.0, min(1.0, cf))
-
-    out = {
-        "function": fn,
-        "confidence": cf,
-        "application": app_field
-    }
-    if "important_regions" in result:
-        out["important_regions"] = result["important_regions"]
-    if "key_amino_acids" in result:
-        out["key_amino_acids"] = result["key_amino_acids"]
-
-    return out
+    return PredictOut(**result)
